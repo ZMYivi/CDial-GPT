@@ -68,7 +68,7 @@ def train():
     logger.warning("Running process %d", args.local_rank)
     logger.info("Arguments: %s", pformat(args))
 
-    trainer = Trainer(args, logger)
+    trainer = Trainer(args, logger, "./save")
     trainer.train()
 
     # trainer.run(train_loader, max_epochs=args.n_epochs)

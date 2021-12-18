@@ -1,5 +1,6 @@
 import torch
 import os
+import tempfile
 import torch.distributed
 import torch.tensor
 import math
@@ -15,8 +16,9 @@ from tqdm.autonotebook import tqdm
 
 
 class Trainer(object):
-    def __init__(self, args, logger):
+    def __init__(self, args, logger, save_dir):
         self.logger = logger
+        self.save_dir = save_dir
 
         # Initialize distributed training if needed
         args.distributed = (args.local_rank != -1)
@@ -66,6 +68,10 @@ class Trainer(object):
         self.metrics = {}
         self.pbar = None
 
+        self.train_saved = []
+        self.eval_saved = []
+        self.eval_saved_iter = 0
+
     def process(self, iteration, batch):
         input_ids, token_type_ids, lm_labels = tuple(input_tensor.to(self.conf.device) for input_tensor in batch)
         self.model.train()
@@ -86,12 +92,18 @@ class Trainer(object):
         self.metrics['loss'] = loss.item()
         self.metrics['lr'] = self.optimizer.param_groups[0]['lr']
 
+    def save(self, obj, path):
+        tmp = tempfile.NamedTemporaryFile(delete=False, dir=self.save_dir)
+        torch.save(obj.state_dict(), path)
+        tmp.close()
+        os.rename(tmp.name, path)
+
     def train(self):
         self.pbar = tqdm(total=len(self.train_loader), leave=True,
                          bar_format='{desc}[{n_fmt}/{total_fmt}] {percentage:3.0f}%|{bar}{postfix} [{elapsed}<{remaining}]',
                          mininterval=2)
         if self.conf.eval_before_start:
-            self.evaluator(self.val_loader, 0)
+            self.evaluate(self.val_loader, 0)
         epoch = 0
         while epoch < self.conf.n_epochs:
             epoch += 1
@@ -103,7 +115,7 @@ class Trainer(object):
                 iteration += 1
 
                 if iteration % self.conf.valid_steps == 0:
-                    self.evaluator(self.val_loader, epoch)
+                    self.evaluate(self.val_loader, epoch)
 
                 if self.conf.scheduler != "linear":
                     self.lr_scheduler.last_epoch = epoch
@@ -128,16 +140,30 @@ class Trainer(object):
                 self.pbar.set_description("Epoch [{}/{}]".format(epoch, self.conf.n_epochs))
                 self.pbar.set_postfix(**{'loss': self.metrics['loss'], 'lr': self.metrics['lr']})
                 self.pbar.update()
-                # todo 打印日志
+                self.logger.info("evaluate {}/loss value: {}, step: {}".format('training', self.metrics['loss'], epoch))
 
-            self.evaluator(self.val_loader, epoch)
+            self.evaluate(self.val_loader, epoch)
             self.pbar.close()
-            # todo 打印日志
-            # todo 保存模型
+            if len(self.train_saved) < 3 or self.train_saved[0][0] < epoch:
+                saved_objs = []
+                save_info = getattr(self.model, 'module', self.model)
+                for name, obj in save_info.items():
+                    fname = 'checkpoint_{}_{}.pth'.format(name, epoch)
+                    path = os.path.join(self.save_dir, fname)
+                    tmp = tempfile.NamedTemporaryFile(delete=False, dir=self.save_dir)
+                    torch.save(obj.state_dict(), path)
+                    tmp.close()
+                    os.rename(tmp.name, path)
+                    saved_objs.append(path)
+                self.train_saved.append((epoch, saved_objs))
+                self.train_saved.sort(key=lambda item: item[0])
+            if len(self.train_saved) > 3:
+                _, paths = self.train_saved.pop(0)
+                for p in paths:
+                    os.remove(p)
+
         if self.conf.n_epochs < 1:
-            self.evaluator(self.val_loader, self.conf.n_epochs)
-
-
+            self.evaluate(self.val_loader, self.conf.n_epochs)
 
     def average_distributed_scalar(self, scalar, args):
         """ Average a scalar over the nodes if we are in distributed training. We use this for distributed evaluation. """
@@ -147,7 +173,7 @@ class Trainer(object):
         torch.distributed.all_reduce(scalar_t, op=torch.distributed.ReduceOp.SUM)
         return scalar_t.item()
 
-    def evaluator(self, data, epoch):
+    def evaluate(self, data, epoch):
         if self.conf.distributed:
             self.valid_sampler.set_epoch(1)
         metrics = {}
@@ -174,5 +200,24 @@ class Trainer(object):
         metrics['average_nll'] = self.average_distributed_scalar([metrics['nll']], self.conf)
         metrics['average_ppl'] = math.exp(*metrics['average_nll'])
         self.pbar.write("Validation: %s" % pformat(metrics))
-        # todo print log
-        # todo checkpoint
+        for k, v in metrics.items():
+            self.logger.info("evaluate {}/{} value: {}, step: {}".format('validation', k, v, epoch))
+
+        self.eval_saved_iter += 1
+        if len(self.eval_saved) < 3 or self.eval_saved[0][0] < self.eval_saved_iter:
+            saved_objs = []
+            save_info = getattr(self.model, 'module', self.model)
+            for name, obj in save_info.items():
+                fname = 'checkpoint_{}_{}.pth'.format(name, epoch)
+                path = os.path.join(self.save_dir, fname)
+                tmp = tempfile.NamedTemporaryFile(delete=False, dir=self.save_dir)
+                torch.save(obj.state_dict(), path)
+                tmp.close()
+                os.rename(tmp.name, path)
+                saved_objs.append(path)
+            self.eval_saved.append((epoch, saved_objs))
+            self.eval_saved.sort(key=lambda item: item[0])
+        if len(self.eval_saved) > 3:
+            _, paths = self.eval_saved.pop(0)
+            for p in paths:
+                os.remove(p)
