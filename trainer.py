@@ -140,17 +140,13 @@ class Trainer(object):
                     self.lr_scheduler.step()
                 else:
                     if self.milestones[0] > self.event_index:
-                        start_index, end_index, start_value, end_value = self.event_index - 1, self.event_index, \
-                                                                         self.values[0], self.values[0]
+                        start_index, end_index, start_value, end_value = self.event_index - 1, self.event_index, self.values[0], self.values[0]
                     elif self.milestones[1] <= self.event_index:
-                        start_index, end_index, start_value, end_value = self.event_index, self.event_index + 1, \
-                                                                         self.values[1], self.values[1]
+                        start_index, end_index, start_value, end_value = self.event_index, self.event_index + 1, self.values[1], self.values[1]
                     else:
-                        start_index, end_index, start_value, end_value = self.milestones[0], self.milestones[1], \
-                                                                         self.values[0], self.values[1]
+                        start_index, end_index, start_value, end_value = self.milestones[0], self.milestones[1], self.values[0], self.values[1]
 
-                    value = start_value + (end_value - start_value) * (self.event_index - start_index) / (
-                            end_index - start_index)
+                    value = start_value + (end_value - start_value) * (self.event_index - start_index) / (end_index - start_index)
                     self.event_index += 1
 
                 for param_group in self.optimizer.param_groups:
@@ -196,6 +192,13 @@ class Trainer(object):
 
         if self.conf.n_epochs < 1:
             self.evaluate(self.val_loader, self.conf.n_epochs)
+
+        if self.conf.local_rank in [-1, 0] and self.conf.n_epochs > 0:
+            os.rename(self.train_saved[-1][1][-1],
+                      os.path.join(self.train_writer.log_dir,
+                                   WEIGHTS_NAME))
+        self.train_writer.close()
+        self.vaild_writer.close()
 
     def average_distributed_scalar(self, scalar):
         """ Average a scalar over the nodes if we are in distributed training. We use this for distributed evaluation. """
