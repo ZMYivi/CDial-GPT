@@ -96,7 +96,6 @@ def train():
                                     never_split=["[speaker1]", "[speaker2]"])
         config = config_class.from_json_file(os.path.join(args.model_checkpoint, CONFIG_NAME))
         model = model_class(config)
-    # model.to(args.device)
 
     logger.info("Prepare datasets")
     if not args.data_path:
@@ -107,10 +106,6 @@ def train():
         train_dataset = WBDataset(datasets["train"], tokenizer)
         valid_dataset = WBDataset(datasets["valid"], tokenizer)
 
-    # Prepare model for FP16 and distributed training if needed (order is important, distributed should be the last)
-    # if args.fp16:
-    #     from apex import amp  # Apex is only required if we use fp16 training
-    #     model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16)
     if args.distributed:
         model = DistributedDataParallel(model, device_ids=[args.local_rank], output_device=args.local_rank)
 

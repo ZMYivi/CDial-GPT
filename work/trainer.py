@@ -171,14 +171,13 @@ class Trainer(object):
             if len(self.train_saved) < 3 or self.train_saved[0][0] < epoch:
                 saved_objs = []
                 save_info = getattr(self.model, 'module', self.model)
-                for name, obj in save_info.items():
-                    fname = 'checkpoint_{}_{}.pth'.format(name, epoch)
-                    path = os.path.join(self.save_dir, fname)
-                    tmp = tempfile.NamedTemporaryFile(delete=False, dir=self.save_dir)
-                    torch.save(obj.state_dict(), path)
-                    tmp.close()
-                    os.rename(tmp.name, path)
-                    saved_objs.append(path)
+                fname = 'checkpoint_{}_{}.pth'.format('mymodel', epoch)
+                path = os.path.join(self.save_dir, fname)
+                tmp = tempfile.NamedTemporaryFile(delete=False, dir=self.save_dir)
+                torch.save(self.model.state_dict(), path)
+                tmp.close()
+                os.rename(tmp.name, path)
+                saved_objs.append(path)
                 self.train_saved.append((epoch, saved_objs))
                 self.train_saved.sort(key=lambda item: item[0])
             if len(self.train_saved) > 3:
@@ -236,14 +235,13 @@ class Trainer(object):
         if len(self.eval_saved) < 3 or self.eval_saved[0][0] < self.eval_saved_iter:
             saved_objs = []
             save_info = getattr(self.model, 'module', self.model)
-            for name, obj in save_info.items():
-                fname = 'checkpoint_{}_{}.pth'.format(name, epoch)
-                path = os.path.join(self.save_dir, fname)
-                tmp = tempfile.NamedTemporaryFile(delete=False, dir=self.save_dir)
-                torch.save(obj.state_dict(), path)
-                tmp.close()
-                os.rename(tmp.name, path)
-                saved_objs.append(path)
+            fname = 'checkpoint_{}_{}.pth'.format('mymodel', epoch)
+            path = os.path.join(self.save_dir, fname)
+            tmp = tempfile.NamedTemporaryFile(delete=False, dir=self.save_dir)
+            torch.save(self.model.state_dict(), path)
+            tmp.close()
+            os.rename(tmp.name, path)
+            saved_objs.append(path)
             self.eval_saved.append((epoch, saved_objs))
             self.eval_saved.sort(key=lambda item: item[0])
         if len(self.eval_saved) > 3:
