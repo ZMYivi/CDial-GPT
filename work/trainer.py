@@ -10,6 +10,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from od.inputters.inputter import build_dataloaders, build_dist_loaders
 from tqdm.autonotebook import tqdm
+from torch.utils.tensorboard import SummaryWriter
 from od.inputters.dataset_wb import WBDataset, WBdistDataset
 from transformers import (OpenAIGPTLMHeadModel, OpenAIGPTConfig, GPT2LMHeadModel, GPT2Config,
                           WEIGHTS_NAME, CONFIG_NAME, AdamW, BertTokenizer)
@@ -32,9 +33,12 @@ class Trainer(object):
         """
         self.logger = logger
         self.save_dir = save_dir
+        self.device = device
         self.model = model
         self.model.to(device)
 
+        self.train_writer = SummaryWriter()
+        self.vaild_writer = SummaryWriter()
         self.train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset) if distributed else None
         self.valid_sampler = torch.utils.data.distributed.DistributedSampler(valid_dataset) if distributed else None
         self.train_loader = DataLoader(train_dataset,
@@ -159,9 +163,15 @@ class Trainer(object):
                                      bar_format='{desc}[{n_fmt}/{total_fmt}] {percentage:3.0f}%|{bar}{postfix} [{elapsed}<{remaining}]',
                                      mininterval=2)
                 self.pbar.set_description("Epoch [{}/{}]".format(epoch, self.conf.n_epochs))
-                self.pbar.set_postfix(**{'loss': self.metrics['loss'], 'lr': self.metrics['lr']})
+                # self.pbar.set_postfix(**{'loss': self.metrics['loss'], 'lr': self.metrics['lr']})
+                self.pbar.set_postfix(loss=self.metrics['loss'], lr=self.metrics['lr'])
                 self.pbar.update()
-                # self.logger.info("training/loss value: {}, step: {}".format('training', self.metrics['loss'], epoch))
+                self.train_writer.add_scalar("training/loss", self.metrics['loss'], iteration)
+                params = {"lr/group_{}".format(i): float(param_group['lr'])
+                          for i, param_group in enumerate(self.optimizer.param_groups)}
+
+                for k, v in params.items():
+                    self.train_writer.add_scalar(k, v, iteration)
 
             # evaluate
             self.evaluate(self.val_loader, epoch)
@@ -170,9 +180,8 @@ class Trainer(object):
             # Save the model, only the latest three
             if len(self.train_saved) < 3 or self.train_saved[0][0] < epoch:
                 saved_objs = []
-                save_info = getattr(self.model, 'module', self.model)
                 fname = 'checkpoint_{}_{}.pth'.format('mymodel', epoch)
-                path = os.path.join(self.save_dir, fname)
+                path = os.path.join(self.train_writer.log_dir, fname)
                 tmp = tempfile.NamedTemporaryFile(delete=False, dir=self.save_dir)
                 torch.save(self.model.state_dict(), path)
                 tmp.close()
@@ -188,11 +197,11 @@ class Trainer(object):
         if self.conf.n_epochs < 1:
             self.evaluate(self.val_loader, self.conf.n_epochs)
 
-    def average_distributed_scalar(self, scalar, args):
+    def average_distributed_scalar(self, scalar):
         """ Average a scalar over the nodes if we are in distributed training. We use this for distributed evaluation. """
         if self.conf.local_rank == -1:
             return scalar
-        scalar_t = torch.tensor(scalar, dtype=torch.float, device=args.device) / torch.distributed.get_world_size()
+        scalar_t = torch.tensor(scalar, dtype=torch.float, device=self.device) / torch.distributed.get_world_size()
         torch.distributed.all_reduce(scalar_t, op=torch.distributed.ReduceOp.SUM)
         return scalar_t.item()
 
@@ -224,18 +233,18 @@ class Trainer(object):
             num_examples += len(lm_labels_flat_shifted)
 
         metrics['nll'] = _sum / num_examples
-        metrics['average_nll'] = self.average_distributed_scalar([metrics['nll']], self.conf)
+        metrics['average_nll'] = self.average_distributed_scalar([metrics['nll']])
         metrics['average_ppl'] = math.exp(*metrics['average_nll'])
-        self.pbar.write("Validation: %s" % pformat(metrics))
+        # self.pbar.write("Validation: %s" % pformat(metrics))
+        tqdm.write("Validation: %s" % pformat(metrics))
         for k, v in metrics.items():
-            self.logger.info("evaluate {}/{} value: {}, step: {}".format('validation', k, v, epoch))
+            self.vaild_writer.add_scalar("validation/{}".format(k), v, epoch)
 
         # Save the model, only the latest three
         self.eval_saved_iter += 1
         if len(self.eval_saved) < 3 or self.eval_saved[0][0] < self.eval_saved_iter:
             saved_objs = []
-            save_info = getattr(self.model, 'module', self.model)
-            fname = 'checkpoint_{}_{}.pth'.format('mymodel', epoch)
+            fname = 'checkpoint_mymodel_{}.pth'.format(epoch)
             path = os.path.join(self.save_dir, fname)
             tmp = tempfile.NamedTemporaryFile(delete=False, dir=self.save_dir)
             torch.save(self.model.state_dict(), path)
