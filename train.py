@@ -1,6 +1,8 @@
 # Copyright (c) 2019-present, HuggingFace Inc.
 # All rights reserved. This source code is licensed under the BSD-style license found in the LICENSE file in the root directory of this source tree.
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = '2,5,6,7'
+
 import math
 import logging
 import random

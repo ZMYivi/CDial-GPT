@@ -1,13 +1,21 @@
 # Copyright (c) 2019-present, HuggingFace Inc.
 # All rights reserved. This source code is licensed under the BSD-style license found in the LICENSE file in the root directory of this source tree.
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = '2,5,6,7'
+
 import logging
 import random
 from pprint import pformat
 from argparse import ArgumentParser
-
 import numpy as np
 import torch
 from work.trainer import Trainer
+from od.inputters.inputter import build_dataloaders, build_dist_loaders
+from transformers import (OpenAIGPTLMHeadModel, OpenAIGPTConfig, GPT2LMHeadModel, GPT2Config,
+                          WEIGHTS_NAME, CONFIG_NAME, AdamW, BertTokenizer)
+from torch.nn.parallel import DistributedDataParallel
+from od.inputters.dataset_wb import WBDataset, WBdistDataset
+from od.inputters.inputter import get_data
 
 
 logger = logging.getLogger(__file__)
@@ -68,7 +76,45 @@ def train():
     logger.warning("Running process %d", args.local_rank)
     logger.info("Arguments: %s", pformat(args))
 
-    trainer = Trainer(args, logger, "./save")
+    # Initialize distributed training if needed
+    args.distributed = (args.local_rank != -1)
+    if args.distributed:
+        torch.cuda.set_device(args.local_rank)
+        args.device = torch.device("cuda", args.local_rank)
+        torch.distributed.init_process_group(backend='nccl', init_method='env://')
+
+    logger.info("Prepare tokenizer, pretrained model and optimizer - add special tokens for fine-tuning")
+    model_class = OpenAIGPTLMHeadModel if not args.gpt2 else GPT2LMHeadModel
+    config_class = OpenAIGPTConfig if not args.gpt2 else GPT2Config
+    tokenizer_class = BertTokenizer
+    if args.pretrained:
+        tokenizer = tokenizer_class.from_pretrained(args.model_checkpoint, do_lower_case=True,
+                                                    never_split=["[speaker1]", "[speaker2]"])
+        model = model_class.from_pretrained(args.model_checkpoint)
+    else:
+        tokenizer = tokenizer_class(os.path.join(args.model_checkpoint, "vocab.txt"), do_lower_case=True,
+                                    never_split=["[speaker1]", "[speaker2]"])
+        config = config_class.from_json_file(os.path.join(args.model_checkpoint, CONFIG_NAME))
+        model = model_class(config)
+    # model.to(args.device)
+
+    logger.info("Prepare datasets")
+    if not args.data_path:
+        train_dataset = WBdistDataset(tokenizer, data_path=args.train_path)
+        valid_dataset = WBdistDataset(tokenizer, data_path=args.valid_path)
+    else:
+        datasets, _ = get_data(tokenizer, args.data_path, args.dataset_cache, logger)
+        train_dataset = WBDataset(datasets["train"], tokenizer)
+        valid_dataset = WBDataset(datasets["valid"], tokenizer)
+
+    # Prepare model for FP16 and distributed training if needed (order is important, distributed should be the last)
+    # if args.fp16:
+    #     from apex import amp  # Apex is only required if we use fp16 training
+    #     model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16)
+    if args.distributed:
+        model = DistributedDataParallel(model, device_ids=[args.local_rank], output_device=args.local_rank)
+
+    trainer = Trainer(args, logger, "./save", model, train_dataset, valid_dataset, args.device, args.distributed)
     trainer.train()
 
     # trainer.run(train_loader, max_epochs=args.n_epochs)
