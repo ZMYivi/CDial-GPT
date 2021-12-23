@@ -6,54 +6,55 @@ import torch.tensor
 import math
 from pprint import pformat
 from torch.nn import CrossEntropyLoss
-from torch.nn.parallel import DistributedDataParallel
 from torch.optim.lr_scheduler import LambdaLR
+from torch.utils.data import DataLoader
+from od.inputters.inputter import build_dataloaders, build_dist_loaders
+from tqdm.autonotebook import tqdm
+from od.inputters.dataset_wb import WBDataset, WBdistDataset
 from transformers import (OpenAIGPTLMHeadModel, OpenAIGPTConfig, GPT2LMHeadModel, GPT2Config,
                           WEIGHTS_NAME, CONFIG_NAME, AdamW, BertTokenizer)
 
-from od.inputters.inputter import build_dataloaders, build_dist_loaders
-from tqdm.autonotebook import tqdm
-
 
 class Trainer(object):
-    def __init__(self, args, logger, save_dir):
+    def __init__(self, args, logger, save_dir, model, train_dataset, valid_dataset, device,
+                 distributed=False, fp16=False):
+        """
+        Init
+        :param args: User-defined parameters
+        :param logger: Configured log
+        :param save_dir: Path to save the file
+        :param model: Algorithm model
+        :param train_dataset: train dataset
+        :param valid_dataset: validation dataset
+        :param device: cpu or gpu
+        :param distributed: does it need to be distributed
+        :param fp16: does it need to be fp16
+        """
         self.logger = logger
         self.save_dir = save_dir
+        self.model = model
+        self.model.to(device)
 
-        # Initialize distributed training if needed
-        args.distributed = (args.local_rank != -1)
-        if args.distributed:
-            torch.cuda.set_device(args.local_rank)
-            args.device = torch.device("cuda", args.local_rank)
-            torch.distributed.init_process_group(backend='nccl', init_method='env://')
+        self.train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset) if distributed else None
+        self.valid_sampler = torch.utils.data.distributed.DistributedSampler(valid_dataset) if distributed else None
+        self.train_loader = DataLoader(train_dataset,
+                                       collate_fn=train_dataset.collate,
+                                       num_workers=args.num_workers,
+                                       sampler=self.train_sampler,
+                                       batch_size=args.train_batch_size,
+                                       shuffle=(not args.distributed))
+        self.val_loader = DataLoader(valid_dataset,
+                                     collate_fn=valid_dataset.collate,
+                                     num_workers=args.num_workers,
+                                     sampler=self.valid_sampler,
+                                     batch_size=args.valid_batch_size,
+                                     shuffle=False)
+        if isinstance(train_dataset, WBdistDataset):
+            self.train_loader.pin_memory = (device == 'cuda')
+        if isinstance(valid_dataset, WBdistDataset):
+            self.val_loader.pin_memory = (device == 'cuda')
 
-        self.logger.info("Prepare tokenizer, pretrained model and optimizer - add special tokens for fine-tuning")
-        model_class = OpenAIGPTLMHeadModel if not args.gpt2 else GPT2LMHeadModel
-        config_class = OpenAIGPTConfig if not args.gpt2 else GPT2Config
-        tokenizer_class = BertTokenizer
-        if args.pretrained:
-            tokenizer = tokenizer_class.from_pretrained(args.model_checkpoint, do_lower_case=True,
-                                                        never_split=["[speaker1]", "[speaker2]"])
-            self.model = model_class.from_pretrained(args.model_checkpoint)
-        else:
-            tokenizer = tokenizer_class(os.path.join(args.model_checkpoint, "vocab.txt"), do_lower_case=True,
-                                        never_split=["[speaker1]", "[speaker2]"])
-            config = config_class.from_json_file(os.path.join(args.model_checkpoint, CONFIG_NAME))
-            self.model = model_class(config)
-        self.model.to(args.device)
-
-        self.optimizer = AdamW([{'params': self.model.parameters(), 'initial_lr': args.lr}], lr=args.lr, correct_bias=True)
-
-        logger.info("Prepare datasets")
-        loader_class = build_dist_loaders if not args.data_path else build_dataloaders
-        self.train_loader, self.val_loader, self.train_sampler, self.valid_sampler = loader_class(args, tokenizer, logger)
-
-        # Prepare model for FP16 and distributed training if needed (order is important, distributed should be the last)
-        if args.fp16:
-            from apex import amp  # Apex is only required if we use fp16 training
-            self.model, optimizer = amp.initialize(self.model, self.optimizer, opt_level=args.fp16)
-        if args.distributed:
-            self.model = DistributedDataParallel(self.model, device_ids=[args.local_rank], output_device=args.local_rank)
+        self.optimizer = AdamW([{'params': model.parameters(), 'initial_lr': args.lr}], lr=args.lr, correct_bias=True)
 
         self.conf = args
 
@@ -72,44 +73,54 @@ class Trainer(object):
         self.eval_saved = []
         self.eval_saved_iter = 0
 
+        self.scaler = torch.cuda.amp.GradScaler(enabled=fp16)
+        self.fp16 = fp16
+
     def process(self, iteration, batch):
-        input_ids, token_type_ids, lm_labels = tuple(input_tensor.to(self.conf.device) for input_tensor in batch)
-        self.model.train()
-        (lm_loss), *_ = self.model(input_ids, labels=lm_labels, token_type_ids=token_type_ids)
-        loss = lm_loss / self.conf.gradient_accumulation_steps
-        if self.conf.fp16:
-            from apex import amp
-            with amp.scale_loss(loss, self.optimizer) as scaled_loss:
-                scaled_loss.backward()
-            torch.nn.utils.clip_grad_norm_(amp.master_params(self.optimizer), self.conf.max_norm)
-        else:
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.conf.max_norm)
+        """
+        The process of training the model
+        :param iteration: Number of iterations
+        :param batch: Data to be trained
+        """
+
+        # used pytorch's half-precision
+        with torch.cuda.amp.autocast(enabled=self.fp16):
+            input_ids, token_type_ids, lm_labels = tuple(input_tensor.to(self.conf.device) for input_tensor in batch)
+            self.model.train()
+            (lm_loss), *_ = self.model(input_ids, labels=lm_labels, token_type_ids=token_type_ids)
+            loss = lm_loss / self.conf.gradient_accumulation_steps
+        self.scaler.scale(loss).backward()
+        self.scaler.unscale_(self.optimizer)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.conf.max_norm)
         if iteration % self.conf.gradient_accumulation_steps == 0:
-            self.optimizer.step()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
             self.optimizer.zero_grad()
 
-        self.metrics['loss'] = loss.item()
-        self.metrics['lr'] = self.optimizer.param_groups[0]['lr']
+        self.metrics['loss'] = self.metrics['loss'] * 0.98 + 0.02 * loss.item() if 'loss' in self.metrics.keys() else loss.item()
+        self.metrics['lr'] = self.metrics['lr'] * 0.98 + 0.02 * self.optimizer.param_groups[0]['lr'] if 'lr' in self.metrics.keys() else self.optimizer.param_groups[0]['lr']
 
     def save(self, obj, path):
+        """
+        Save the content of a training to the specified path
+        :param obj: Model to be saved
+        :param path: User-specified save path
+        """
         tmp = tempfile.NamedTemporaryFile(delete=False, dir=self.save_dir)
         torch.save(obj.state_dict(), path)
         tmp.close()
         os.rename(tmp.name, path)
 
     def train(self):
-        self.pbar = tqdm(total=len(self.train_loader), leave=True,
-                         bar_format='{desc}[{n_fmt}/{total_fmt}] {percentage:3.0f}%|{bar}{postfix} [{elapsed}<{remaining}]',
-                         mininterval=2)
         if self.conf.eval_before_start:
             self.evaluate(self.val_loader, 0)
         epoch = 0
+        # start loop
         while epoch < self.conf.n_epochs:
             epoch += 1
+            self.metrics = {}
             if self.conf.distributed:
                 self.train_sampler.set_epoch(epoch)
-
             iteration = 0
             for batch in self.train_loader:
                 iteration += 1
@@ -117,33 +128,46 @@ class Trainer(object):
                 if iteration % self.conf.valid_steps == 0:
                     self.evaluate(self.val_loader, epoch)
 
+                # According to the logic of ignite, the learning rate needs to be calculated in two cases
                 if self.conf.scheduler != "linear":
                     self.lr_scheduler.last_epoch = epoch
                     lr_list = self.lr_scheduler.get_lr()
                     value = lr_list[0]
+                    self.lr_scheduler.step()
                 else:
                     if self.milestones[0] > self.event_index:
-                        start_index, end_index, start_value, end_value = self.event_index - 1, self.event_index, self.values[0], self.values[0]
+                        start_index, end_index, start_value, end_value = self.event_index - 1, self.event_index, \
+                                                                         self.values[0], self.values[0]
                     elif self.milestones[1] <= self.event_index:
-                        start_index, end_index, start_value, end_value = self.event_index, self.event_index + 1, self.values[1], self.values[1]
+                        start_index, end_index, start_value, end_value = self.event_index, self.event_index + 1, \
+                                                                         self.values[1], self.values[1]
                     else:
-                        start_index, end_index, start_value, end_value = self.milestones[0], self.milestones[1], self.values[0], self.values[1]
+                        start_index, end_index, start_value, end_value = self.milestones[0], self.milestones[1], \
+                                                                         self.values[0], self.values[1]
 
                     value = start_value + (end_value - start_value) * (self.event_index - start_index) / (
-                                end_index - start_index)
+                            end_index - start_index)
                     self.event_index += 1
 
                 for param_group in self.optimizer.param_groups:
                     param_group['lr'] = value
                 self.process(iteration, batch)
 
+                # update tqdm
+                if self.pbar is None:
+                    self.pbar = tqdm(total=len(self.train_loader), leave=True,
+                                     bar_format='{desc}[{n_fmt}/{total_fmt}] {percentage:3.0f}%|{bar}{postfix} [{elapsed}<{remaining}]',
+                                     mininterval=2)
                 self.pbar.set_description("Epoch [{}/{}]".format(epoch, self.conf.n_epochs))
                 self.pbar.set_postfix(**{'loss': self.metrics['loss'], 'lr': self.metrics['lr']})
                 self.pbar.update()
-                self.logger.info("evaluate {}/loss value: {}, step: {}".format('training', self.metrics['loss'], epoch))
+                # self.logger.info("training/loss value: {}, step: {}".format('training', self.metrics['loss'], epoch))
 
+            # evaluate
             self.evaluate(self.val_loader, epoch)
             self.pbar.close()
+
+            # Save the model, only the latest three
             if len(self.train_saved) < 3 or self.train_saved[0][0] < epoch:
                 saved_objs = []
                 save_info = getattr(self.model, 'module', self.model)
@@ -174,6 +198,11 @@ class Trainer(object):
         return scalar_t.item()
 
     def evaluate(self, data, epoch):
+        """
+        evaluate
+        :param data: data to be evaluate
+        :param epoch: epoch of train
+        """
         if self.conf.distributed:
             self.valid_sampler.set_epoch(1)
         metrics = {}
@@ -182,7 +211,6 @@ class Trainer(object):
         loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-1)
 
         for batch in data:
-
             self.model.eval()
             with torch.no_grad():
                 input_ids, token_type_ids, lm_labels = tuple(
@@ -203,6 +231,7 @@ class Trainer(object):
         for k, v in metrics.items():
             self.logger.info("evaluate {}/{} value: {}, step: {}".format('validation', k, v, epoch))
 
+        # Save the model, only the latest three
         self.eval_saved_iter += 1
         if len(self.eval_saved) < 3 or self.eval_saved[0][0] < self.eval_saved_iter:
             saved_objs = []
