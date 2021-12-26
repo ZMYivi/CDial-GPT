@@ -9,7 +9,7 @@ from pprint import pformat
 from argparse import ArgumentParser
 import numpy as np
 import torch
-from work.trainer import Trainer
+from trainer import Trainer
 from od.inputters.inputter import build_dataloaders, build_dist_loaders
 from transformers import (OpenAIGPTLMHeadModel, OpenAIGPTConfig, GPT2LMHeadModel, GPT2Config,
                           WEIGHTS_NAME, CONFIG_NAME, AdamW, BertTokenizer)
@@ -109,7 +109,7 @@ def train():
     if args.distributed:
         model = DistributedDataParallel(model, device_ids=[args.local_rank], output_device=args.local_rank)
 
-    trainer = Trainer(args, logger, "./save", model, train_dataset, valid_dataset, args.device, args.distributed)
+    trainer = Trainer(args, logger, tokenizer, model, train_dataset, valid_dataset, args.device, args.distributed)
     trainer.train()
 
 

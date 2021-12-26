@@ -5,19 +5,16 @@ import torch.distributed
 import torch.tensor
 import math
 from pprint import pformat
-from torch.nn import CrossEntropyLoss
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
-from od.inputters.inputter import build_dataloaders, build_dist_loaders
 from tqdm.autonotebook import tqdm
 from torch.utils.tensorboard import SummaryWriter
-from od.inputters.dataset_wb import WBDataset, WBdistDataset
-from transformers import (OpenAIGPTLMHeadModel, OpenAIGPTConfig, GPT2LMHeadModel, GPT2Config,
-                          WEIGHTS_NAME, CONFIG_NAME, AdamW, BertTokenizer)
+from od.inputters.dataset_wb import WBdistDataset
+from transformers import (WEIGHTS_NAME, AdamW, CONFIG_NAME)
 
 
 class Trainer(object):
-    def __init__(self, args, logger, save_dir, model, train_dataset, valid_dataset, device,
+    def __init__(self, args, logger, tokenizer, model, train_dataset, valid_dataset, device,
                  distributed=False, fp16=False):
         """
         Init
@@ -32,7 +29,7 @@ class Trainer(object):
         :param fp16: does it need to be fp16
         """
         self.logger = logger
-        self.save_dir = save_dir
+        self.tokenizer = tokenizer
         self.device = device
         self.model = model
         self.model.to(device)
@@ -70,6 +67,10 @@ class Trainer(object):
         self.values = [args.lr, 0.0]
         self.event_index = 0
 
+        torch.save(args, self.train_writer.log_dir + '/model_training_args.bin')
+        getattr(model, 'module', model).config.to_json_file(os.path.join(self.train_writer.log_dir, CONFIG_NAME))
+        self.tokenizer.save_vocabulary(self.train_writer.log_dir)
+
         self.metrics = {}
         self.pbar = None
 
@@ -103,17 +104,6 @@ class Trainer(object):
 
         self.metrics['loss'] = self.metrics['loss'] * 0.98 + 0.02 * loss.item() if 'loss' in self.metrics.keys() else loss.item()
         self.metrics['lr'] = self.metrics['lr'] * 0.98 + 0.02 * self.optimizer.param_groups[0]['lr'] if 'lr' in self.metrics.keys() else self.optimizer.param_groups[0]['lr']
-
-    def save(self, obj, path):
-        """
-        Save the content of a training to the specified path
-        :param obj: Model to be saved
-        :param path: User-specified save path
-        """
-        tmp = tempfile.NamedTemporaryFile(delete=False, dir=self.save_dir)
-        torch.save(obj.state_dict(), path)
-        tmp.close()
-        os.rename(tmp.name, path)
 
     def train(self):
         if self.conf.eval_before_start:
@@ -159,7 +149,6 @@ class Trainer(object):
                                      bar_format='{desc}[{n_fmt}/{total_fmt}] {percentage:3.0f}%|{bar}{postfix} [{elapsed}<{remaining}]',
                                      mininterval=2)
                 self.pbar.set_description("Epoch [{}/{}]".format(epoch, self.conf.n_epochs))
-                # self.pbar.set_postfix(**{'loss': self.metrics['loss'], 'lr': self.metrics['lr']})
                 self.pbar.set_postfix(loss=self.metrics['loss'], lr=self.metrics['lr'])
                 self.pbar.update()
                 self.train_writer.add_scalar("training/loss", self.metrics['loss'], iteration)
@@ -178,7 +167,7 @@ class Trainer(object):
                 saved_objs = []
                 fname = 'checkpoint_{}_{}.pth'.format('mymodel', epoch)
                 path = os.path.join(self.train_writer.log_dir, fname)
-                tmp = tempfile.NamedTemporaryFile(delete=False, dir=self.save_dir)
+                tmp = tempfile.NamedTemporaryFile(delete=False, dir=os.path.expanduser(self.train_writer.log_dir))
                 torch.save(self.model.state_dict(), path)
                 tmp.close()
                 os.rename(tmp.name, path)
@@ -236,8 +225,8 @@ class Trainer(object):
             num_examples += len(lm_labels_flat_shifted)
 
         metrics['nll'] = _sum / num_examples
-        metrics['average_nll'] = self.average_distributed_scalar([metrics['nll']])
-        metrics['average_ppl'] = math.exp(*metrics['average_nll'])
+        metrics['average_nll'] = self.average_distributed_scalar(metrics['nll'])
+        metrics['average_ppl'] = math.exp(metrics['average_nll'])
         # self.pbar.write("Validation: %s" % pformat(metrics))
         tqdm.write("Validation: %s" % pformat(metrics))
         for k, v in metrics.items():
@@ -248,8 +237,8 @@ class Trainer(object):
         if len(self.eval_saved) < 3 or self.eval_saved[0][0] < self.eval_saved_iter:
             saved_objs = []
             fname = 'checkpoint_mymodel_{}.pth'.format(epoch)
-            path = os.path.join(self.save_dir, fname)
-            tmp = tempfile.NamedTemporaryFile(delete=False, dir=self.save_dir)
+            path = os.path.join(self.vaild_writer.log_dir, fname)
+            tmp = tempfile.NamedTemporaryFile(delete=False, dir=os.path.expanduser(self.vaild_writer.log_dir))
             torch.save(self.model.state_dict(), path)
             tmp.close()
             os.rename(tmp.name, path)
